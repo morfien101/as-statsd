@@ -225,7 +225,9 @@ class UDPProcessingTests(ProcessorTestCase):
         self.connector = statsd.Connector(host=self.statsd_server.host,
                                           port=self.statsd_server.port,
                                           ip_protocol=self.ip_protocol,
-                                          reconnect_sleep=0.25)
+                                          reconnect_sleep=0.25,
+                                          tag_type="datadog"
+                                          )
         await self.connector.start()
 
     async def asyncTearDown(self):
@@ -241,6 +243,19 @@ class UDPProcessingTests(ProcessorTestCase):
         self.assertEqual(self.statsd_server.metrics[0],
                          b'counters.counter:1|c')
         self.assertEqual(self.statsd_server.metrics[1], b'timers.timer:1.0|ms')
+
+    async def test_sending_metrics_with_tags(self):
+        self.connector.incr(
+            'counter', tags={"tag1": "value1", "tag2": "value2"})
+        self.connector.timing('timer', 0.001, tags={
+                              "tag1": "value1", "tag2": "value2"})
+        await self.wait_for(self.statsd_server.message_received.acquire())
+        await self.wait_for(self.statsd_server.message_received.acquire())
+
+        self.assertEqual(self.statsd_server.metrics[0],
+                         b'counters.counter:1|c#tag1=value1,tag2=value2')
+        self.assertEqual(
+            self.statsd_server.metrics[1], b'timers.timer:1.0|ms#tag1=value1,tag2=value2')
 
     async def test_that_client_sends_to_new_server(self):
         self.statsd_server.close()
