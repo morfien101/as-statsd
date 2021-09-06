@@ -223,7 +223,8 @@ class Connector(AbstractConnector):
         ``socket.IPPROTO_UDP`` for UDP sockets.
     :keyword prefix: optional string to prepend to metric paths
     :keyword default_tags: A dictionary containing default tags for metrics.
-    :keyword tag_type:  Either ``telegraf`` or ``datagod`` example: ``user.logins,service=payroll,region=us-west:1|c`` or ``user.logins:1|c#service:payroll,region:us-west``
+    # service:payroll,region:us-west``
+    :keyword tag_type:  Either ``influx`` or ``datagod`` example: ``user.logins,service=payroll,region=us-west:1|c`` or ``user.logins:1|c
 
     :param kwargs: additional keyword parameters are passed
         to the :class:`.Processor` initializer
@@ -277,17 +278,18 @@ class Connector(AbstractConnector):
 
     def __init__(self,
                  host: str,
+                 loop: asyncio.AbstractEventLoop,
                  port: int = 8125,
                  *,
                  prefix: str = '',
                  default_tags: dict = {},
-                 tag_type: str = 'telegraf',
+                 tag_type: str = 'influx',
                  **kwargs: typing.Any
                  ) -> None:
         super().__init__()
         self.logger = logging.getLogger(__package__).getChild('Connector')
         self.prefix = f'{prefix}.' if prefix else prefix
-        self.processor = Processor(host=host, port=port, **kwargs)
+        self.processor = Processor(host=host, port=port, loop=loop, **kwargs)
         self.default_tags = default_tags
         self.tag_type = tag_type
         self._enqueue_log_guard = ThrottleGuard(100)
@@ -321,7 +323,7 @@ class Connector(AbstractConnector):
 
     def format_tags(self, tags: dict) -> str:
         tags_list = []
-        if self.tag_type == "telegraf":
+        if self.tag_type == "influx":
             restricted_chars = re.compile(r"[=|,]")
             for name, value in tags:
                 if restricted_chars.search(name) is not None or restricted_chars.search(value) is not None:
@@ -337,18 +339,27 @@ class Connector(AbstractConnector):
                         f'statsd tag with name [{name}] and value [{value}] contains illegal characters. Dropping tag."')
                     continue
                 tags_list.append(f'{name}:{value}')
-        return ','.join(tags_list.sort())
 
-    def compile_metric(self, path: str, value: str, type_code: str, rate: str, tags: str) -> str:
+        compiled_tags = ','.join(tags_list.sort())
+        return compiled_tags
+
+    def compile_metric(self, path: str, value: str, type_code: str, rate: str, tags: dict) -> str:
         out = ""
-        rate_text = f'@{rate}' if rate is not '' else ''
+        rate_text = f'|@{rate}' if rate != '' else ''
+        if len(tags) < 0:
+            out = f'{self.prefix}{path}:{value}|{type_code}{rate_text}\n'
+        else:
+            tags_list = []
+            seperator = "=" if self.tag_type == "influx" else ":"
 
-        if tags == "":
-            out = f'{self.prefix}{path}:{value}|{type_code}{rate_text}'
-        elif self.tag_type == "telegraf":
-            out = f'{self.prefix}{path},{tags}:{value}|{type_code}{rate_text}'
-        elif self.tag_type == "datadog":
-            out = f'{self.prefix}{path}{value}|{type_code}{rate_text}#{tags}'
+            for tag_key, tag_value in tags.items():
+                tags_list.append(f'{tag_key}{seperator}{tag_value}')
+            tag_text = ",".join(tags_list)
+
+            if self.tag_type == "influx":
+                out = f'{self.prefix}{path},{tag_text}:{value}|{type_code}{rate_text}\n'
+            elif self.tag_type == "datadog":
+                out = f'{self.prefix}{path}:{value}|{type_code}{rate_text}|#{tag_text}\n'
 
         return out
 
@@ -557,6 +568,7 @@ class Processor:
                  *,
                  host: str,
                  port: int = 8125,
+                 loop: asyncio.AbstractEventLoop,
                  ip_protocol: int = socket.IPPROTO_TCP,
                  max_queue_size: int = 1000,
                  reconnect_sleep: float = 1.0,
@@ -590,13 +602,13 @@ class Processor:
         self._reconnect_sleep = reconnect_sleep
         self._wait_timeout = wait_timeout
 
-        self.running = asyncio.Event()
-        self.stopped = asyncio.Event()
+        self.running = asyncio.Event(loop=loop)
+        self.stopped = asyncio.Event(loop=loop)
         self.stopped.set()
         self.logger = logging.getLogger(__package__).getChild('Processor')
         self.should_terminate = False
         self.protocol = None
-        self.queue = asyncio.Queue(maxsize=max_queue_size)
+        self.queue = asyncio.Queue(maxsize=max_queue_size, loop=loop)
 
     @property
     def connected(self) -> bool:
