@@ -6,6 +6,99 @@ import time
 import typing
 import copy
 import re
+from contextvars import ContextVar
+from enum import Enum
+
+
+class Flavour(str, Enum):
+    DATADOG = "datadog"
+    TELEGRAF = "telegraf"
+
+
+TELEGRAF_RESTRICTED_CHARS = re.compile(r"[=|,]")
+DATADOG_RESTRICTED_CHARS = re.compile(r"[#|:|,]")
+
+
+def validate_telegraf_tag(value: str) -> None:
+    """Validate tags according to telegraf's specification."""
+
+    match = TELEGRAF_RESTRICTED_CHARS.match(value)
+
+    if match is not None:
+        raise ValueError("Invalid tag")
+
+
+def validate_datadog_tag(value: str) -> None:
+    """Validate tags according to datadogs's specification."""
+
+    match = DATADOG_RESTRICTED_CHARS.match(value)
+
+    if match is not None:
+        raise ValueError("Invalid tag")
+
+
+def serialize_tag_dict(
+    tags: typing.Dict[str, str],
+    delimiter: str,
+    validate_tag_callable: typing.Callable[[str], None],
+) -> str:
+    """Serialize the tag for statsd."""
+
+    serialized_tags = set()
+    for k, v in tags.items():
+        validate_tag_callable(f"{k} {v}")
+        serialized_tags.add(f"{k}{delimiter}{v}")
+
+    return ",".join(serialized_tags)
+
+
+def serialize_rate(rate: str) -> str:
+    if rate != "":
+        rate = f'|@{rate}'
+
+    return rate
+
+
+def compile_metric_datadog(
+    prefix: str,
+    path: str,
+    value: str,
+    type_code: str,
+    rate: str = "",
+    tags: typing.Optional[typing.Dict[str, str]] = None,
+) -> str:
+    """Compile metrics for datadog."""
+
+    rate = serialize_rate(rate)
+
+    if tags is None:
+        return f"{prefix}{path}:{value}|{type_code}{rate}"
+
+    serialized_tags = serialize_tag_dict(
+        tags=tags, delimiter=":", validate_tag_callable=validate_datadog_tag
+    )
+    return f"{prefix}{path}:{value}|{type_code}{rate}|#{serialized_tags}\n"
+
+
+def compile_metric_telegraf(
+    prefix: str,
+    path: str,
+    value: str,
+    type_code: str,
+    rate: str = "",
+    tags: typing.Optional[typing.Dict[str, str]] = None,
+) -> str:
+    """Compile metrics for telegraf."""
+
+    rate = serialize_rate(rate)
+
+    if tags is None:
+        return f"{prefix}{path}:{value}|{type_code}{rate}"
+
+    serialized_tags = serialize_tag_dict(
+        tags=tags, delimiter="=", validate_tag_callable=validate_telegraf_tag
+    )
+    return f"{prefix}{path},{serialized_tags}:{value}|{type_code}{rate}\n"
 
 
 class ThrottleGuard:
@@ -34,16 +127,14 @@ class ThrottleGuard:
 
     """
 
-    def __init__(self, threshold: int):
+    def __init__(self, threshold: int) -> None:
         self.counter = 0
         self.threshold = threshold
 
     def allow_execution(self) -> bool:
         """Should this execution be allowed?"""
         self.counter += 1
-        allow = (self.counter < self.threshold
-                 or (self.counter % self.threshold) == 0)
-        return allow
+        return self.counter < self.threshold or (self.counter % self.threshold) == 0
 
     def reset(self) -> None:
         """Reset counter after error has resolved."""
@@ -70,21 +161,24 @@ class Timer:
     twice in a row will result in a :exc:`RuntimeError` as well.
 
     """
-    _start_time: typing.Union[None, float]
-    _finish_time: typing.Union[None, float]
 
-    def __init__(self, connector: 'AbstractConnector', path: str, tags: dict):
+    _start_time: typing.Optional[float]
+    _finish_time: typing.Optional[float]
+
+    def __init__(
+        self, connector: "AbstractConnector", path: str, tags: typing.Dict[str, str]
+    ) -> None:
         self._connector = connector
         self._path = path
         self._start_time, self._finish_time = None, None
         self.tags = tags
 
-    def start(self) -> 'Timer':
+    def start(self) -> "Timer":
         """Start the timer and return `self`."""
         self._start_time = time.time()
         return self
 
-    def stop(self, send: bool = True) -> 'Timer':
+    def stop(self, send: bool = True) -> "Timer":
         """Stop the timer and send the timing.
 
         :param send: immediately send the recorded timing to the
@@ -94,11 +188,15 @@ class Timer:
         parameter to :data:`False`.
 
         """
+
         if self._start_time is None:
-            raise RuntimeError('Timer.stop called before start')
+            raise RuntimeError("Timer.stop called before start")
+
         self._finish_time = time.time()
+
         if send:
             self.send()
+
         return self
 
     def send(self) -> None:
@@ -110,24 +208,27 @@ class Timer:
 
         """
         if self._start_time is None:
-            raise RuntimeError('Timer.send called before start')
+            raise RuntimeError("Timer.send called before start")
         if self._finish_time is None:
-            raise RuntimeError('Timer.send called before stop')
+            raise RuntimeError("Timer.send called before stop")
 
         self._connector.timing(
             self._path,
             max(self._finish_time, self._start_time) - self._start_time,
-            self.tags
+            self.tags,
         )
         self._start_time, self._finish_time = None, None
 
-    def __enter__(self) -> 'Timer':
+    def __enter__(self) -> "Timer":
         self.start()
         return self
 
-    def __exit__(self, exc_type: typing.Union[typing.Type[Exception], None],
-                 exc_val: typing.Union[Exception, None],
-                 exc_tb: typing.Union[typing.Tuple, None]) -> None:
+    def __exit__(
+        self,
+        exc_type: typing.Union[typing.Type[Exception], None],
+        exc_val: typing.Union[Exception, None],
+        exc_tb: typing.Union[typing.Tuple[typing.Any], None],
+    ) -> None:
         self.stop()
 
 
@@ -138,26 +239,40 @@ class AbstractConnector:
     interface without doing any real work.
 
     """
+
     async def start(self) -> None:
         pass
 
     async def stop(self) -> None:
         pass
 
-    def inject_metric(self, path: str, value: str, type_code: str, rate: str, tags: dict) -> None:
+    def inject_metric(
+        self,
+        path: str,
+        value: str,
+        type_code: str,
+        rate: str,
+        tags: typing.Dict[str, str],
+    ) -> None:
         pass
 
-    def incr(self, path: str, value: int, rate: str, tags: dict) -> None:
+    def incr(
+        self, path: str, value: int, rate: str, tags: typing.Dict[str, str]
+    ) -> None:
         """Increment a counter metric.
 
         :param path: counter to increment
         :param value: amount to increment the counter by
 
         """
-        self.inject_metric(path=path, value=value,
-                           type_code='c', rate=rate, tags=tags)
 
-    def decr(self, path: str, value: int, rate: str, tags: dict) -> None:
+        self.inject_metric(
+            path=path, value=str(value), type_code="c", rate=rate, tags=tags
+        )
+
+    def decr(
+        self, path: str, value: int, rate: str, tags: typing.Dict[str, str]
+    ) -> None:
         """Decrement a counter metric.
 
         :param path: counter to decrement
@@ -166,13 +281,19 @@ class AbstractConnector:
         This is equivalent to ``self.incr(path, -value)``.
 
         """
-        value_str = f'{value}'
-        if value < 0:
-            value_str = f'-{value}'
-        self.inject_metric(path=path, value=value_str,
-                           type_code='c', rate=rate, tags=tags)
 
-    def gauge(self, path: str, value: int, tags: dict, delta: bool = False) -> None:
+        if value < 0:
+            value_str = f"-{value}"
+        else:
+            value_str = f"{value}"
+
+        self.inject_metric(
+            path=path, value=value_str, type_code="c", rate=rate, tags=tags
+        )
+
+    def gauge(
+        self, path: str, value: int, tags: typing.Dict[str, str], delta: bool = False
+    ) -> None:
         """Manipulate a gauge metric.
 
         :param path: gauge to adjust
@@ -184,33 +305,47 @@ class AbstractConnector:
         `value` is an adjustment for the current gauge.
 
         """
+
         if delta:
-            payload = f'{value:+d}'
+            payload = f"{value:+d}"
         else:
             payload = str(value)
-        self.inject_metric(f'gauges.{path}', payload, 'g', tags=tags)
 
-    def timing(self, path: str,
-               seconds: typing.Union[float, datetime.timedelta],
-               tags: dict
-               ) -> None:
+        self.inject_metric(f"gauges.{path}", payload, "g", rate="", tags=tags)
+
+    def timing(
+        self,
+        path: str,
+        seconds: typing.Union[float, datetime.timedelta],
+        tags: typing.Dict[str, str],
+    ) -> None:
         """Send a timer metric.
 
         :param path: timer to append a value to
         :param seconds: number of **seconds** to record
 
         """
+
         if isinstance(seconds, datetime.timedelta):
             seconds = seconds.total_seconds()
-        self.inject_metric(f'timers.{path}', str(seconds * 1000.0), 'ms', tags)
 
-    def timer(self, path: str) -> Timer:
+        self.inject_metric(
+            f"timers.{path}", str(seconds * 1000.0), "ms", rate="", tags=tags
+        )
+
+    def timer(
+        self, path: str, tags: typing.Optional[typing.Dict[str, str]] = None
+    ) -> Timer:
         """Send a timer metric using a context manager.
 
         :param path: timer to append the measured time to
 
         """
-        return Timer(self, path)
+
+        if tags is None:
+            tags = {}
+
+        return Timer(connector=self, path=path, tags=tags)
 
 
 class Connector(AbstractConnector):
@@ -223,8 +358,7 @@ class Connector(AbstractConnector):
         ``socket.IPPROTO_UDP`` for UDP sockets.
     :keyword prefix: optional string to prepend to metric paths
     :keyword default_tags: A dictionary containing default tags for metrics.
-    # service:payroll,region:us-west``
-    :keyword tag_type:  Either ``influx`` or ``datagod`` example: ``user.logins,service=payroll,region=us-west:1|c`` or ``user.logins:1|c
+    :keyword tag_type:  Either ``telegraf`` or ``datagod`` example: ``user.logins,service=payroll,region=us-west:1|c`` or ``user.logins:1|c#service:payroll,region:us-west``
 
     :param kwargs: additional keyword parameters are passed
         to the :class:`.Processor` initializer
@@ -272,36 +406,46 @@ class Connector(AbstractConnector):
        sends the metric payloads.
 
     """
+
     logger: logging.Logger
     prefix: str
-    processor: 'Processor'
+    processor: "Processor"
 
-    def __init__(self,
-                 host: str,
-                 loop: asyncio.AbstractEventLoop,
-                 port: int = 8125,
-                 *,
-                 prefix: str = '',
-                 default_tags: dict = {},
-                 tag_type: str = 'influx',
-                 **kwargs: typing.Any
-                 ) -> None:
-        super().__init__()
-        self.logger = logging.getLogger(__package__).getChild('Connector')
-        self.prefix = f'{prefix}.' if prefix else prefix
-        self.processor = Processor(host=host, port=port, loop=loop, **kwargs)
-        self.default_tags = default_tags
+    def __init__(
+        self,
+        host: str,
+        port: int = 8125,
+        *,
+        prefix: str = "",
+        default_tags: typing.Optional[typing.Dict[str, str]] = None,
+        tag_type: typing.Union[str, Flavour] = Flavour.TELEGRAF,
+        **kwargs: typing.Any,
+    ) -> None:
+        """"""
+
+        self.logger = logging.getLogger(__package__).getChild("Connector")
+        self.prefix = f"{prefix}." if prefix else prefix
+        self.processor = Processor(host=host, port=port, **kwargs)
         self.tag_type = tag_type
         self._enqueue_log_guard = ThrottleGuard(100)
         self._processor_task: typing.Optional[asyncio.Task[None]] = None
+
+        if default_tags is None:
+            self.default_tags = {}
+        else:
+            self.default_tags = default_tags
 
     async def start(self) -> None:
         """Start the processor in the background.
 
         This is a *blocking* method and does not return until the
         processor task is actually running.
-
         """
+
+        self.processor.running = asyncio.Event()
+        self.processor.stopped = asyncio.Event()
+        self.processor.queue = asyncio.Queue(maxsize=1000)
+
         self._processor_task = asyncio.create_task(self.processor.run())
         await self.processor.running.wait()
 
@@ -312,58 +456,54 @@ class Connector(AbstractConnector):
         the statsd server if possible.  This is a *blocking* method
         and does not return until the background processor has
         stopped.
-
         """
+
         await self.processor.stop()
 
-    def merge_tags(self, metric_tags: dict) -> dict:
+    def merge_tags(self, metric_tags: typing.Dict[str, str]) -> typing.Dict[str, str]:
         out = copy.deepcopy(self.default_tags)
         out.update(metric_tags)
         return out
 
-    def format_tags(self, tags: dict) -> str:
-        tags_list = []
-        if self.tag_type == "influx":
-            restricted_chars = re.compile(r"[=|,]")
-            for name, value in tags:
-                if restricted_chars.search(name) is not None or restricted_chars.search(value) is not None:
-                    self.logger.warning(
-                        f'statsd tag with name [{name}] and value [{value}] contains illegal characters. Dropping tag."')
-                    continue
-                tags_list.append(f'{name}={value}')
-        elif self.tag_type == "datadog":
-            restricted_chars = re.compile(r"[#|:|,]")
-            for name, value in tags:
-                if restricted_chars.search(name) is not None or restricted_chars.search(value) is not None:
-                    self.logger.warning(
-                        f'statsd tag with name [{name}] and value [{value}] contains illegal characters. Dropping tag."')
-                    continue
-                tags_list.append(f'{name}:{value}')
+    def compile_metric(
+        self,
+        path: str,
+        value: str,
+        type_code: str,
+        rate: str,
+        tags: typing.Dict[str, str],
+    ) -> str:
+        """"""
 
-        compiled_tags = ','.join(tags_list.sort())
-        return compiled_tags
-
-    def compile_metric(self, path: str, value: str, type_code: str, rate: str, tags: dict) -> str:
-        out = ""
-        rate_text = f'|@{rate}' if rate != '' else ''
-        if len(tags) < 0:
-            out = f'{self.prefix}{path}:{value}|{type_code}{rate_text}\n'
+        if self.tag_type == Flavour.TELEGRAF:
+            return compile_metric_telegraf(
+                prefix=self.prefix,
+                path=path,
+                value=value,
+                type_code=type_code,
+                rate=rate,
+                tags=tags,
+            )
+        elif self.tag_type == Flavour.DATADOG:
+            return compile_metric_datadog(
+                prefix=self.prefix,
+                path=path,
+                value=value,
+                type_code=type_code,
+                rate=rate,
+                tags=tags,
+            )
         else:
-            tags_list = []
-            seperator = "=" if self.tag_type == "influx" else ":"
+            raise ValueError(f"Unhandled tag type {self.tag_type!r}")
 
-            for tag_key, tag_value in tags.items():
-                tags_list.append(f'{tag_key}{seperator}{tag_value}')
-            tag_text = ",".join(tags_list)
-
-            if self.tag_type == "influx":
-                out = f'{self.prefix}{path},{tag_text}:{value}|{type_code}{rate_text}\n'
-            elif self.tag_type == "datadog":
-                out = f'{self.prefix}{path}:{value}|{type_code}{rate_text}|#{tag_text}\n'
-
-        return out
-
-    def inject_metric(self, path: str, value: str, type_code: str, rate: str, tags: dict) -> None:
+    def inject_metric(
+        self,
+        path: str,
+        value: str,
+        type_code: str,
+        rate: str,
+        tags: typing.Dict[str, str],
+    ) -> None:
         """Send a metric to the statsd server.
 
         :param path: formatted metric name
@@ -374,16 +514,22 @@ class Connector(AbstractConnector):
 
         This method formats the payload and inserts it on the
         internal queue for future processing.
-
         """
+
         payload = self.compile_metric(
-            path, value, type_code, rate, self.merge_tags(tags))
+            path=path,
+            value=value,
+            type_code=type_code,
+            rate=rate,
+            tags=self.merge_tags(tags),
+        )
+
         try:
-            self.processor.enqueue(payload.encode('utf-8'))
+            self.processor.enqueue(payload.encode("utf-8"))
             self._enqueue_log_guard.reset()
         except asyncio.QueueFull:
             if self._enqueue_log_guard.allow_execution():
-                self.logger.warning('statsd queue is full, discarding metric')
+                self.logger.warning("statsd queue is full, discarding metric")
 
 
 class StatsdProtocol(asyncio.BaseProtocol):
@@ -408,16 +554,17 @@ class StatsdProtocol(asyncio.BaseProtocol):
        Is the protocol currently connected?
 
     """
+
     buffered_data: bytes
     ip_protocol: int = socket.IPPROTO_NONE
     logger: logging.Logger
     transport: typing.Optional[asyncio.BaseTransport]
 
     def __init__(self) -> None:
-        self.buffered_data = b''
+        self.buffered_data = b""
         self.connected = asyncio.Event()
-        self.logger = logging.getLogger(__package__).getChild(
-            self.__class__.__name__)
+        self.logger = logging.getLogger(
+            __package__).getChild(self.__class__.__name__)
         self.transport = None
 
     def send(self, metric: bytes) -> None:
@@ -431,25 +578,26 @@ class StatsdProtocol(asyncio.BaseProtocol):
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         """Capture the new transport and set the connected event."""
         # NB - this will return a 4-part tuple in some cases
-        server, port = transport.get_extra_info('peername')[:2]
-        self.logger.info('connected to statsd %s:%s', server, port)
+        server, port = transport.get_extra_info("peername")[:2]
+        self.logger.info("connected to statsd %s:%s", server, port)
         self.transport = transport
         self.transport.set_protocol(self)
         self.connected.set()
 
     def connection_lost(self, exc: typing.Optional[Exception]) -> None:
         """Clear the connected event."""
-        self.logger.warning('statsd server connection lost: %s', exc)
+        self.logger.warning("statsd server connection lost: %s", exc)
         self.connected.clear()
 
 
 class TCPProtocol(StatsdProtocol, asyncio.Protocol):
     """StatsdProtocol implementation over a TCP/IP connection."""
+
     ip_protocol = socket.IPPROTO_TCP
     transport: asyncio.WriteTransport
 
     def eof_received(self) -> None:
-        self.logger.warning('received EOF from statsd server')
+        self.logger.warning("received EOF from statsd server")
         self.connected.clear()
 
     def send(self, metric: bytes) -> None:
@@ -464,22 +612,25 @@ class TCPProtocol(StatsdProtocol, asyncio.Protocol):
         if not self.buffered_data and not metric:
             return
 
-        self.buffered_data = self.buffered_data + metric + b'\n'
-        while (self.transport is not None and self.connected.is_set()
-               and self.buffered_data):
-            line, maybe_nl, rest = self.buffered_data.partition(b'\n')
+        self.buffered_data = self.buffered_data + metric + b"\n"
+        while (
+            self.transport is not None
+            and self.connected.is_set()
+            and self.buffered_data
+        ):
+            line, maybe_nl, rest = self.buffered_data.partition(b"\n")
             line += maybe_nl
             self.transport.write(line)
             if self.transport.is_closing():
-                self.logger.warning('transport closed during write')
+                self.logger.warning("transport closed during write")
                 break
             self.buffered_data = rest
 
     async def shutdown(self) -> None:
         """Close the transport after flushing any outstanding data."""
-        self.logger.info('shutting down')
+        self.logger.info("shutting down")
         if self.connected.is_set():
-            self.send(b'')  # flush buffered data
+            self.send(b"")  # flush buffered data
             self.transport.close()
             while self.connected.is_set():
                 await asyncio.sleep(0.1)
@@ -487,6 +638,7 @@ class TCPProtocol(StatsdProtocol, asyncio.Protocol):
 
 class UDPProtocol(StatsdProtocol, asyncio.DatagramProtocol):
     """StatsdProtocol implementation over a UDP/IP connection."""
+
     ip_protocol = socket.IPPROTO_UDP
     transport: asyncio.DatagramTransport
 
@@ -495,7 +647,7 @@ class UDPProtocol(StatsdProtocol, asyncio.DatagramProtocol):
             self.transport.sendto(metric)
 
     async def shutdown(self) -> None:
-        self.logger.info('shutting down')
+        self.logger.info("shutting down")
         self.transport.close()
 
 
@@ -557,32 +709,25 @@ class Processor:
 
     """
 
-    logger: logging.Logger
-    protocol: typing.Optional[StatsdProtocol]
-    queue: asyncio.Queue
-    _create_transport: typing.Callable[[], typing.Coroutine[
-        typing.Any, typing.Any, typing.Tuple[asyncio.BaseTransport,
-                                             StatsdProtocol]]]
-
-    def __init__(self,
-                 *,
-                 host: str,
-                 port: int = 8125,
-                 loop: asyncio.AbstractEventLoop,
-                 ip_protocol: int = socket.IPPROTO_TCP,
-                 max_queue_size: int = 1000,
-                 reconnect_sleep: float = 1.0,
-                 wait_timeout: float = 0.1) -> None:
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int = 8125,
+        ip_protocol: int = socket.IPPROTO_TCP,
+        reconnect_sleep: float = 1.0,
+        wait_timeout: float = 0.1,
+    ) -> None:
         super().__init__()
         if not host:
-            raise RuntimeError('host must be set')
+            raise RuntimeError("host must be set")
         try:
             port = int(port)
             if not port or port < 1:
                 raise RuntimeError(
-                    f'port must be a positive integer: {port!r}')
+                    f"port must be a positive integer: {port!r}")
         except (TypeError, ValueError):
-            raise RuntimeError(f'port must be a positive integer: {port!r}')
+            raise RuntimeError(f"port must be a positive integer: {port!r}")
 
         transport_creators = {
             socket.IPPROTO_TCP: self._create_tcp_transport,
@@ -591,9 +736,9 @@ class Processor:
         try:
             factory = transport_creators[ip_protocol]
         except KeyError:
-            raise RuntimeError(f'ip_protocol {ip_protocol} is not supported')
+            raise RuntimeError(f"ip_protocol {ip_protocol} is not supported")
         else:
-            self._create_transport = factory  # type: ignore
+            self._create_transport = factory
 
         self.host = host
         self.port = port
@@ -602,13 +747,37 @@ class Processor:
         self._reconnect_sleep = reconnect_sleep
         self._wait_timeout = wait_timeout
 
-        self.running = asyncio.Event(loop=loop)
-        self.stopped = asyncio.Event(loop=loop)
-        self.stopped.set()
-        self.logger = logging.getLogger(__package__).getChild('Processor')
+        self._running: ContextVar[asyncio.Event] = ContextVar("running")
+        self._stopped: ContextVar[asyncio.Event] = ContextVar("stopped")
+        self._queue: ContextVar[asyncio.Queue[bytes]] = ContextVar("queue")
+
+        self.logger = logging.getLogger(__package__).getChild("Processor")
         self.should_terminate = False
-        self.protocol = None
-        self.queue = asyncio.Queue(maxsize=max_queue_size, loop=loop)
+        self.protocol: typing.Optional[StatsdProtocol] = None
+
+    @property
+    def running(self) -> asyncio.Event:
+        return self._running.get()
+
+    @running.setter
+    def running(self, event: asyncio.Event) -> None:
+        self._running.set(event)
+
+    @property
+    def stopped(self) -> asyncio.Event:
+        return self._stopped.get()
+
+    @stopped.setter
+    def stopped(self, event: asyncio.Event) -> None:
+        self._stopped.set(event)
+
+    @property
+    def queue(self) -> typing.Any:
+        return self._queue.get()
+
+    @queue.setter
+    def queue(self, queue: typing.Any) -> None:
+        self._queue.set(queue)
 
     @property
     def connected(self) -> bool:
@@ -620,34 +789,38 @@ class Processor:
 
     async def run(self) -> None:
         """Maintains the connection and processes metric payloads."""
+
         self.running.set()
         self.stopped.clear()
         self.should_terminate = False
+
         while not self.should_terminate:
             try:
                 await self._connect_if_necessary()
                 if self.connected:
                     await self._process_metric()
             except asyncio.CancelledError:
-                self.logger.info('task cancelled, exiting')
+                self.logger.info("task cancelled, exiting")
                 self.should_terminate = True
             except Exception as error:
-                self.logger.exception('unexpected error occurred: %s', error)
+                self.logger.exception("unexpected error occurred: %s", error)
                 self.should_terminate = True
 
         self.should_terminate = True
-        self.logger.info('loop finished with %d metrics in the queue',
-                         self.queue.qsize())
+        self.logger.info(
+            "loop finished with %d metrics in the queue", self.queue.qsize()
+        )
         if self.connected:
             num_ready = max(self.queue.qsize(), 1)
-            self.logger.info('draining %d metrics', num_ready)
+            self.logger.info("draining %d metrics", num_ready)
             for _ in range(num_ready):
                 await self._process_metric()
-            self.logger.debug('closing transport')
+            self.logger.debug("closing transport")
+
         if self.protocol is not None:
             await self.protocol.shutdown()
 
-        self.logger.info('processor is exiting')
+        self.logger.info("processor is exiting")
         self.running.clear()
         self.stopped.set()
 
@@ -663,59 +836,67 @@ class Processor:
         await self.stopped.wait()
 
     async def _create_tcp_transport(
-            self) -> typing.Tuple[asyncio.BaseTransport, StatsdProtocol]:
+        self,
+    ) -> typing.Tuple[asyncio.BaseTransport, StatsdProtocol]:
         t, p = await asyncio.get_running_loop().create_connection(
-            protocol_factory=TCPProtocol, host=self.host, port=self.port)
+            protocol_factory=TCPProtocol, host=self.host, port=self.port
+        )
         return t, typing.cast(StatsdProtocol, p)
 
     async def _create_udp_transport(
-            self) -> typing.Tuple[asyncio.BaseTransport, StatsdProtocol]:
+        self,
+    ) -> typing.Tuple[asyncio.BaseTransport, StatsdProtocol]:
         t, p = await asyncio.get_running_loop().create_datagram_endpoint(
             protocol_factory=UDPProtocol,
             remote_addr=(self.host, self.port),
-            reuse_port=True)
+            reuse_port=True,
+        )
         return t, typing.cast(StatsdProtocol, p)
 
     async def _connect_if_necessary(self) -> None:
         if self.protocol is not None:
             try:
-                await asyncio.wait_for(self.protocol.connected.wait(),
-                                       self._wait_timeout)
+                await asyncio.wait_for(
+                    self.protocol.connected.wait(), self._wait_timeout
+                )
             except asyncio.TimeoutError:
-                self.logger.debug('protocol is no longer connected')
+                self.logger.debug("protocol is no longer connected")
 
         if not self.connected:
             try:
-                buffered_data = b''
+                buffered_data = b""
                 if self.protocol is not None:
                     buffered_data = self.protocol.buffered_data
 
-                t, p = await self._create_transport()  # type: ignore[misc]
+                t, p = await self._create_transport()
                 transport, self.protocol = t, p
                 self.protocol.buffered_data = buffered_data
                 self.logger.info(
-                    'connection established to %s after %s attempts',
-                    transport.get_extra_info('peername'),
-                    self._connect_log_guard.counter)
+                    "connection established to %s after %s attempts",
+                    transport.get_extra_info("peername"),
+                    self._connect_log_guard.counter,
+                )
                 self._connect_log_guard.reset()
             except IOError as error:
                 if self._connect_log_guard.allow_execution():
                     self.logger.warning(
-                        'connection to %s:%s failed: %s (%s attempts)',
-                        self.host, self.port, error,
-                        self._connect_log_guard.counter)
+                        "connection to %s:%s failed: %s (%s attempts)",
+                        self.host,
+                        self.port,
+                        error,
+                        self._connect_log_guard.counter,
+                    )
                 await asyncio.sleep(self._reconnect_sleep)
 
     async def _process_metric(self) -> None:
         try:
-            metric = await asyncio.wait_for(self.queue.get(),
-                                            self._wait_timeout)
-            self.logger.debug('received %r from queue', metric)
+            metric = await asyncio.wait_for(self.queue.get(), self._wait_timeout)
+            self.logger.debug("received %r from queue", metric)
             self.queue.task_done()
         except asyncio.TimeoutError:
             # we still want to invoke the protocol send in case
             # it has queued metrics to send
-            metric = b''
+            metric = b""
 
         assert self.protocol is not None  # AFAICT, this cannot happen
         self.protocol.send(metric)

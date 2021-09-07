@@ -1,33 +1,53 @@
 from as_statsd import statsd
-import time
+
 import asyncio
 import socket
 
-loop = asyncio.get_event_loop()
 
-sc = statsd.Connector(
+datadog = statsd.Connector(
     host="127.0.0.1",
-    port="8125",
-    tag_type="datadog",
+    port=8125,
+    tag_type=statsd.Flavour.DATADOG,
     default_tags={"src_env": "local_dev"},
     ip_protocol=socket.IPPROTO_UDP,
-    loop=loop
+)
+
+telegraf = statsd.Connector(
+    host="127.0.0.1",
+    port=8125,
+    tag_type=statsd.Flavour.TELEGRAF,
+    default_tags={"src_env": "local_dev"},
+    ip_protocol=socket.IPPROTO_UDP,
 )
 
 
-async def do_stuff():
+async def datadog_do_stuff() -> None:
     while True:
         for i in range(0, 100):
             print(i)
-            sc.incr("tester", i, "1", tags={"tag1": "value1"})
+            datadog.incr("datadog", i, "1", tags={"tag1": "the dawg"})
             await asyncio.sleep(0.25)
 
 
-async def main():
-    await sc.start()
-    try:
-        await do_stuff()
-    finally:
-        await sc.stop()
+async def telegraf_do_stuff() -> None:
+    while True:
+        for i in range(0, 100):
+            print(i)
+            telegraf.incr("telegraf", i, "1", tags={"tag1": "telegraf"})
+            await asyncio.sleep(0.25)
 
-loop.run_until_complete(main())
+
+async def main() -> None:
+    await datadog.start()
+    await telegraf.start()
+
+    try:
+        datadog_task = asyncio.create_task(datadog_do_stuff())
+        telegraf_task = asyncio.create_task(telegraf_do_stuff())
+
+        await asyncio.gather(telegraf_task, datadog_task)
+    finally:
+        await datadog.stop()
+        await telegraf.stop()
+
+asyncio.run(main())
